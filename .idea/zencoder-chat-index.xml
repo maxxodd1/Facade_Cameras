@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ai.zencoder.plugin.chat.index">
+    <option name="activeChatId" value="282ae9f2-15ee-4652-9a5a-745af5757313" />
+    <option name="chatMetadata" value="{&quot;3dec58bc-8a71-4176-8db4-0f208c090a62&quot;:{&quot;id&quot;:&quot;3dec58bc-8a71-4176-8db4-0f208c090a62&quot;,&quot;title&quot;:&quot;Generate Repository Information File&quot;,&quot;createdAt&quot;:1754746133510,&quot;updatedAt&quot;:1754746462071,&quot;isNameGenerated&quot;:true,&quot;messageCount&quot;:11,&quot;lastMessagePreview&quot;:&quot;Я обновлю файл репозитория на русском языке. Сначала проанализирую текущий файл и внесу необходимые ...&quot;},&quot;282ae9f2-15ee-4652-9a5a-745af5757313&quot;:{&quot;id&quot;:&quot;282ae9f2-15ee-4652-9a5a-745af5757313&quot;,&quot;title&quot;:&quot;Код Анализ и Ошибки&quot;,&quot;createdAt&quot;:1754747060925,&quot;updatedAt&quot;:1754752902326,&quot;isAgent&quot;:true,&quot;isNameGenerated&quot;:true,&quot;messageCount&quot;:14,&quot;lastMessagePreview&quot;:&quot;\n\n\n\nОтлично! Файл синтаксически корректен. Теперь создам краткую сводку всех реализованных улучшений...&quot;}}" />
+  </component>
+</project>
