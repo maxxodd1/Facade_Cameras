@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Быстрые фасады",
     "author": "Максим Ефанов",
-    "version": (6, 6, 1),
+    "version": (6, 7, 0),
     "blender": (4, 5, 0),
     "location": "3D View > N-панель > Быстрые фасады",
     "description": "Создаёт камеры по полигонам для рендера фасадов с автоматическим расчётом расстояния, clipping planes и созданием папок, рендером выделенных камер, рендером камер объекта и управлением по объектам. Добавлены специальные рендер-настройки и пользовательские пресеты.",
@@ -203,6 +203,482 @@ def calculate_clipping_planes(obj, camera_location, camera_direction):
     except Exception as e:
         print(f"Неожиданная ошибка при расчёте clipping planes: {e}")
         return DEFAULT_CLIPPING_START, DEFAULT_CLIPPING_END
+
+
+def validate_output_path(output_path, blend_filepath):
+    """
+    Валидировать путь вывода для предотвращения path traversal.
+
+    Args:
+        output_path: Путь для проверки
+        blend_filepath: Путь к .blend файлу
+
+    Returns:
+        str: Валидированный путь или None если невалиден
+    """
+    if not output_path or not blend_filepath:
+        return None
+
+    try:
+        # Получаем абсолютные пути
+        abs_output = os.path.abspath(bpy.path.abspath(output_path))
+        abs_blend_dir = os.path.abspath(os.path.dirname(blend_filepath))
+
+        # Получаем реальные пути без символических ссылок
+        real_output = os.path.realpath(abs_output)
+        real_blend = os.path.realpath(abs_blend_dir)
+
+        # Проверяем что output находится внутри проекта
+        # Разрешаем путь только если он находится в папке blend файла или её подпапках
+        if real_output.startswith(real_blend):
+            return abs_output
+        else:
+            print(f"[SECURITY WARNING] Путь {output_path} находится за пределами проекта")
+            return None
+    except (OSError, ValueError) as e:
+        print(f"[SECURITY ERROR] Ошибка валидации пути: {e}")
+        return None
+
+
+def find_3d_viewport(context):
+    """
+    Найти первый 3D viewport и сохранить его настройки.
+
+    Returns:
+        tuple: (area, space_data, original_settings_dict) или (None, None, {})
+    """
+    if not context.screen:
+        return None, None, {}
+
+    for area in context.screen.areas:
+        if area.type == 'VIEW_3D':
+            space_data = area.spaces.active
+            original_settings = {
+                'view_persp': space_data.region_3d.view_perspective,
+                'show_overlays': space_data.overlay.show_overlays,
+                'shading_type': space_data.shading.type,
+                'shading_light': space_data.shading.light,
+                'shading_color': space_data.shading.color_type,
+                'wireframe_threshold': getattr(space_data.overlay, 'wireframe_threshold', None),
+                'show_wireframes': getattr(space_data.overlay, 'show_wireframes', None),
+            }
+            return area, space_data, original_settings
+    return None, None, {}
+
+
+def restore_3d_viewport(area, space_data, original_settings):
+    """Восстановить настройки 3D viewport"""
+    if not area or not space_data or not original_settings:
+        return
+
+    try:
+        if 'view_persp' in original_settings and original_settings['view_persp']:
+            space_data.region_3d.view_perspective = original_settings['view_persp']
+        if 'show_overlays' in original_settings:
+            space_data.overlay.show_overlays = original_settings['show_overlays']
+        if 'shading_type' in original_settings and original_settings['shading_type']:
+            space_data.shading.type = original_settings['shading_type']
+        if 'shading_light' in original_settings and original_settings['shading_light']:
+            space_data.shading.light = original_settings['shading_light']
+        if 'shading_color' in original_settings and original_settings['shading_color']:
+            space_data.shading.color_type = original_settings['shading_color']
+        if 'wireframe_threshold' in original_settings and original_settings['wireframe_threshold'] is not None:
+            if hasattr(space_data.overlay, 'wireframe_threshold'):
+                space_data.overlay.wireframe_threshold = original_settings['wireframe_threshold']
+        if 'show_wireframes' in original_settings and original_settings['show_wireframes'] is not None:
+            if hasattr(space_data.overlay, 'show_wireframes'):
+                space_data.overlay.show_wireframes = original_settings['show_wireframes']
+    except Exception as e:
+        print(f"[WARNING] Ошибка при восстановлении настроек viewport: {e}")
+
+
+def render_cameras_common(operator, context, settings, cameras_to_render):
+    """
+    Общий метод рендера для всех операторов.
+
+    Args:
+        operator: Экземпляр оператора для report()
+        context: Blender context
+        settings: sde_cam_pro_settings
+        cameras_to_render: Список камер для рендера
+
+    Returns:
+        {'FINISHED'} или {'CANCELLED'}
+    """
+    # Сохранение исходных настроек
+    original_camera = context.scene.camera
+    original_res_x = context.scene.render.resolution_x
+    original_res_y = context.scene.render.resolution_y
+    original_percentage = context.scene.render.resolution_percentage
+    original_filepath = context.scene.render.filepath
+    original_format = context.scene.render.image_settings.file_format
+    original_mode = context.mode
+
+    # Добавленные сохранения для рендера
+    scene = context.scene
+    original_display_device = scene.display_settings.display_device
+    original_view_transform = scene.view_settings.view_transform
+
+    # Безопасный поиск 3D viewport для сохранения настроек outline
+    original_show_object_outline = False
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            if area.type == 'VIEW_3D':
+                space = area.spaces.active
+                if hasattr(space, 'shading') and hasattr(space.shading, 'show_object_outline'):
+                    original_show_object_outline = space.shading.show_object_outline
+                    break
+
+    # Используем новую функцию для поиска viewport
+    view3d_area, space_data, original_viewport_settings = find_3d_viewport(context)
+
+    wm = context.window_manager
+    rendered_count = 0
+    original_visibility_state = {}
+
+    try:
+        # Переходим в Object Mode
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Определяем объект для рендера - ищем меш, а не камеру
+        target_object = context.active_object
+        # Если активный объект - камера, ищем меш по имени камеры
+        if target_object and target_object.type == 'CAMERA':
+            cam_name = target_object.name
+            print(f"[DEBUG] Активная камера: {cam_name}")
+
+            # Способ 1: извлекаем имя объекта из имени камеры (формат: ObjectName_face_XXX)
+            if '_face_' in cam_name:
+                object_name = cam_name.split('_face_')[0]
+                mesh_object = bpy.data.objects.get(object_name)
+                if mesh_object and mesh_object.type == 'MESH':
+                    target_object = mesh_object
+                    print(f"[DEBUG] Найден меш по имени камеры: {target_object.name}")
+
+            # Способ 2: ищем через коллекции камер (если первый не сработал)
+            if target_object.type == 'CAMERA':
+                for collection in bpy.data.collections:
+                    if collection.name.startswith(CAM_COLLECTION_PREFIX) and target_object in collection.objects.values():
+                        # Извлекаем имя объекта из имени коллекции
+                        obj_name_from_collection = collection.name[len(CAM_COLLECTION_PREFIX):]
+                        mesh_object = bpy.data.objects.get(obj_name_from_collection)
+                        if mesh_object and mesh_object.type == 'MESH':
+                            target_object = mesh_object
+                            print(f"[DEBUG] Найден меш через коллекцию: {target_object.name}")
+                            break
+
+        print(f"[DEBUG] Целевой объект для рендера: {target_object.name if target_object else 'None'}")
+
+        # Сохраняем исходное состояние видимости всех объектов для восстановления
+        for obj in context.scene.objects:
+            if obj.type == 'MESH':
+                original_visibility_state[obj.name] = (obj.hide_viewport, obj.hide_render)
+        print("[DEBUG] Используем динамическое управление видимостью для каждой камеры")
+
+        # Настройки рендера
+        if settings.ignore_percentage:
+            context.scene.render.resolution_percentage = 100
+
+        # Специальные настройки для рендера
+        scene.display_settings.display_device = 'sRGB'
+        scene.view_settings.view_transform = 'Standard'
+
+        # Безопасное отключение outline во всех 3D viewport
+        for screen in bpy.data.screens:
+            for area in screen.areas:
+                if area.type == 'VIEW_3D':
+                    space = area.spaces.active
+                    if hasattr(space, 'shading') and hasattr(space.shading, 'show_object_outline'):
+                        space.shading.show_object_outline = False
+
+        # Настройки viewport
+        if view3d_area and space_data:
+            space_data.shading.type = 'SOLID'
+            space_data.shading.light = 'FLAT'
+            space_data.shading.color_type = 'TEXTURE'
+            # Включаем overlays для wireframe
+            space_data.overlay.show_overlays = True
+            # Настраиваем wireframe
+            if hasattr(space_data.overlay, 'show_wireframes'):
+                space_data.overlay.show_wireframes = True
+            if hasattr(space_data.overlay, 'wireframe_threshold'):
+                space_data.overlay.wireframe_threshold = 0.5
+
+        # Создаем папку для рендеров с валидацией
+        if settings.output_path:
+            validated_path = validate_output_path(settings.output_path, bpy.data.filepath)
+            if validated_path:
+                output_dir = validated_path
+            else:
+                operator.report({'WARNING'}, "Путь находится за пределами проекта. Используется автоматический путь.")
+                output_dir = bpy.path.abspath(get_auto_output_path(target_object.name if target_object else "renders"))
+        else:
+            output_dir = bpy.path.abspath(get_auto_output_path(target_object.name if target_object else "renders"))
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as e:
+            operator.report({'ERROR'}, f"Не удалось создать папку {output_dir}: {str(e)}. Используется временная папка")
+            output_dir = os.path.join(bpy.app.tempdir, "renders")
+            os.makedirs(output_dir, exist_ok=True)
+
+        cameras_to_render.sort(key=lambda cam: cam.name)
+        wm.progress_begin(0, len(cameras_to_render))
+
+        # Цикл рендера
+        for i, cam in enumerate(cameras_to_render):
+            try:
+                print(f"[DEBUG] Рендер камеры: {cam.name}")
+
+                # Динамическое управление видимостью - показываем только объект этой камеры
+                current_cam_object = None
+                # Определяем объект для текущей камеры
+                cam_name_parts = cam.name.split('_face_')
+                if len(cam_name_parts) == 2:
+                    current_obj_name = cam_name_parts[0]
+                    current_cam_object = bpy.data.objects.get(current_obj_name)
+
+                # Скрываем все объекты кроме нужного
+                if current_cam_object:
+                    print(f"[DEBUG] Показываем только объект: {current_cam_object.name}")
+                    for obj in context.scene.objects:
+                        if obj.type == 'MESH':
+                            if obj == current_cam_object:
+                                obj.hide_viewport = False
+                                obj.hide_render = False
+                            else:
+                                obj.hide_viewport = True
+                                obj.hide_render = True
+
+                # Принудительно обновляем сцену для отображения изменений
+                context.view_layer.update()
+
+                # Устанавливаем камеру
+                context.scene.camera = cam
+                # Безопасное получение разрешения с проверками
+                res_x = cam.get(CAM_RES_X_PROP, 1920)
+                res_y = cam.get(CAM_RES_Y_PROP, 1080)
+                context.scene.render.resolution_x = res_x
+                context.scene.render.resolution_y = res_y
+
+                print(f"[DEBUG] Разрешение: {res_x} x {res_y}")
+                print(f"[DEBUG] Clipping: {cam.data.clip_start} - {cam.data.clip_end}")
+                print(f"[DEBUG] Позиция камеры: {cam.location}")
+                print(f"[DEBUG] Ортографический масштаб: {cam.data.ortho_scale}")
+
+                # Отладка видимости объектов
+                print(f"[DEBUG] Проверка видимости объектов:")
+                visible_meshes = []
+                for obj in context.scene.objects:
+                    if obj.type == 'MESH':
+                        is_visible = not obj.hide_viewport and not obj.hide_render
+                        print(f"[DEBUG]   {obj.name}: viewport={not obj.hide_viewport}, render={not obj.hide_render}, видим={is_visible}")
+                        if is_visible:
+                            visible_meshes.append(obj.name)
+                print(f"[DEBUG] Видимых мешей: {len(visible_meshes)}: {visible_meshes}")
+
+                # Проверка настроек камеры
+                print(f"[DEBUG] Камера настройки:")
+                print(f"[DEBUG]   Тип: {cam.data.type}")
+                print(f"[DEBUG]   Ортографический масштаб: {cam.data.ortho_scale}")
+                print(f"[DEBUG]   Направление: {cam.rotation_euler}")
+                print(f"[DEBUG]   Матрица: {cam.matrix_world}")
+
+                # Принудительно обновляем сцену
+                context.view_layer.update()
+                context.evaluated_depsgraph_get().update()
+
+                # Настройка viewport для рендера
+                if view3d_area and space_data:
+                    space_data.region_3d.view_perspective = 'CAMERA'
+
+                    # Принудительно обновляем viewport
+                    for region in view3d_area.regions:
+                        if region.type == 'WINDOW':
+                            # Перерисовываем область
+                            region.tag_redraw()
+
+                    # Даём время на обновление
+                    bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+
+                # Проверяем, что камера действительно активна
+                if context.scene.camera != cam:
+                    print(f"[ERROR] Камера не установилась! Ожидалась: {cam.name}, получена: {context.scene.camera.name if context.scene.camera else 'None'}")
+                    continue
+
+                # Подготавливаем файл для сохранения с новым именованием
+                # Извлекаем информацию из камеры
+                facade_direction = cam.get(CAM_DIRECTION_PROP, "Неизв")
+
+                # Извлекаем имя объекта и номер фасада из имени камеры
+                cam_name_parts = cam.name.split('_face_')
+                if len(cam_name_parts) == 2:
+                    obj_name = cam_name_parts[0]
+                    face_number = cam_name_parts[1]
+                else:
+                    obj_name = cam.name
+                    face_number = "001"
+
+                # Создаем новое имя файла с версионностью
+                filename = get_versioned_filename(output_dir, obj_name, face_number, facade_direction)
+                filepath = os.path.join(output_dir, filename)
+                context.scene.render.filepath = filepath
+                context.scene.render.image_settings.file_format = 'PNG'
+                context.scene.render.image_settings.color_mode = 'RGBA'
+                context.scene.render.image_settings.color_depth = '8'
+
+                print(f"[DEBUG] Сохранение в: {filepath}")
+                print(f"[DEBUG] Имя файла: {filename}")
+                print(f"[DEBUG] Объект: {obj_name}, Фасад: {face_number}, Направление: {facade_direction}")
+
+                # Пробуем разные методы рендера
+                render_success = False
+
+                # Метод 1: Стандартный OpenGL рендер
+                try:
+                    print("[DEBUG] Попытка 1: bpy.ops.render.opengl")
+                    bpy.ops.render.opengl(write_still=True)
+
+                    # Проверяем, создался ли файл
+                    if os.path.exists(filepath):
+                        try:
+                            if os.path.getsize(filepath) > MIN_FILE_SIZE:
+                                render_success = True
+                                print("[DEBUG] Успех методом 1")
+                        except OSError as e:
+                            print(f"[DEBUG] Не удалось проверить размер файла: {e}")
+                except Exception as e:
+                    print(f"[DEBUG] Метод 1 неудачен: {e}")
+
+                # Метод 2: Если первый не сработал, пробуем viewport рендер
+                if not render_success:
+                    try:
+                        print("[DEBUG] Попытка 2: viewport рендер")
+
+                        # Делаем снимок viewport напрямую
+                        if view3d_area:
+                            # Находим 3D viewport region
+                            for region in view3d_area.regions:
+                                if region.type == 'WINDOW':
+                                    # Устанавливаем контекст для области
+                                    override = {
+                                        'area': view3d_area,
+                                        'region': region,
+                                        'scene': context.scene,
+                                        'camera': cam
+                                    }
+
+                                    with context.temp_override(**override):
+                                        bpy.ops.render.opengl(write_still=True, view_context=True)
+
+                                    if os.path.exists(filepath):
+                                        try:
+                                            if os.path.getsize(filepath) > MIN_FILE_SIZE:
+                                                render_success = True
+                                                print("[DEBUG] Успех методом 2")
+                                        except OSError as e:
+                                            print(f"[DEBUG] Не удалось проверить размер файла: {e}")
+                                    break
+                    except Exception as e:
+                        print(f"[DEBUG] Метод 2 неудачен: {e}")
+
+                # Метод 3: Ручное сохранение изображения
+                if not render_success:
+                    try:
+                        print("[DEBUG] Попытка 3: ручное сохранение")
+
+                        # Принудительно рендерим в память
+                        bpy.ops.render.opengl(write_still=False)
+
+                        # Получаем изображение из рендера
+                        image = bpy.data.images.get('Render Result')
+                        if image:
+                            # Сохраняем вручную
+                            image.save_render(filepath)
+                            if os.path.exists(filepath):
+                                try:
+                                    if os.path.getsize(filepath) > MIN_FILE_SIZE:
+                                        render_success = True
+                                        print("[DEBUG] Успех методом 3")
+                                except OSError as e:
+                                    print(f"[DEBUG] Не удалось проверить размер файла: {e}")
+                    except Exception as e:
+                        print(f"[DEBUG] Метод 3 неудачен: {e}")
+
+                if render_success:
+                    rendered_count += 1
+                    print(f"[DEBUG] Камера {cam.name} успешно отрендерена")
+                else:
+                    print(f"[ERROR] Не удалось отрендерить камеру {cam.name}")
+                    # Создаём пустой файл для отладки
+                    with open(filepath.replace('.png', '_ERROR.txt'), 'w', encoding='utf-8') as f:
+                        f.write(f"Ошибка рендера камеры {cam.name}\n")
+                        f.write(f"Разрешение: {cam.get(CAM_RES_X_PROP, 'N/A')} x {cam.get(CAM_RES_Y_PROP, 'N/A')}\n")
+                        f.write(f"Позиция: {cam.location}\n")
+                        f.write(f"Clipping: {cam.data.clip_start} - {cam.data.clip_end}\n")
+
+                wm.progress_update(i + 1)
+
+            except Exception as e:
+                print(f"[ERROR] Критическая ошибка при рендере камеры {cam.name}: {e}")
+                # Продолжаем с следующей камерой
+                continue
+
+    except Exception as e:
+        operator.report({'ERROR'}, f"Критическая ошибка при рендере: {e}")
+    finally:
+        # Восстановление настроек
+        wm.progress_end()
+
+        # Восстанавливаем видимость объектов
+        for obj_name, original_visibility in original_visibility_state.items():
+            obj = bpy.data.objects.get(obj_name)
+            if obj:
+                if isinstance(original_visibility, tuple):
+                    obj.hide_viewport, obj.hide_render = original_visibility
+                else:
+                    # Совместимость со старым форматом
+                    obj.hide_viewport = original_visibility
+
+        context.scene.camera = original_camera
+        context.scene.render.resolution_x = original_res_x
+        context.scene.render.resolution_y = original_res_y
+        context.scene.render.resolution_percentage = original_percentage
+        context.scene.render.filepath = original_filepath
+        context.scene.render.image_settings.file_format = original_format
+
+        # Восстанавливаем специальные настройки
+        scene.display_settings.display_device = original_display_device
+        scene.view_settings.view_transform = original_view_transform
+
+        # Восстанавливаем outline во всех 3D viewport
+        for screen in bpy.data.screens:
+            for area in screen.areas:
+                if area.type == 'VIEW_3D':
+                    space = area.spaces.active
+                    if hasattr(space, 'shading') and hasattr(space.shading, 'show_object_outline'):
+                        space.shading.show_object_outline = original_show_object_outline
+
+        # Восстанавливаем режим
+        if original_mode != 'OBJECT' and context.mode == 'OBJECT':
+            try:
+                if original_mode and '_' in original_mode:
+                    mode_name = original_mode.split('_')[-1]
+                    if mode_name in ['EDIT', 'SCULPT', 'VERTEX_PAINT', 'WEIGHT_PAINT', 'TEXTURE_PAINT']:
+                        bpy.ops.object.mode_set(mode=mode_name)
+            except Exception as e:
+                print(f"Не удалось восстановить режим {original_mode}: {e}")
+
+        # Восстанавливаем viewport используя новую функцию
+        restore_3d_viewport(view3d_area, space_data, original_viewport_settings)
+
+    if rendered_count > 0:
+        operator.report({'INFO'}, f"Рендер завершён: {rendered_count} изображений сохранено в {output_dir}")
+    else:
+        operator.report({'WARNING'}, "Ни одно изображение не было отрендерено")
+
+    return {'FINISHED'}
 
 
 # ------------------------------------------------------------------------
@@ -439,6 +915,19 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
 
             final_cam_location, cam_rotation_quat, ortho_scale, res_x, res_y, clip_start, clip_end, facade_direction = cam_data_tuple
 
+            # Валидация параметров камеры
+            if ortho_scale <= 0:
+                print(f"[CAMERA ERROR] Некорректный ortho_scale={ortho_scale:.3f}, используем значение по умолчанию")
+                ortho_scale = 10.0
+
+            if clip_start >= clip_end:
+                print(f"[CAMERA ERROR] clip_start ({clip_start:.3f}) >= clip_end ({clip_end:.3f}), корректируем")
+                clip_start = DEFAULT_CLIPPING_START
+                clip_end = max(clip_start + 10.0, DEFAULT_CLIPPING_END)
+
+            if clip_start < 0.001:
+                clip_start = DEFAULT_CLIPPING_START
+
             cam_name = f"{short_name}_face_{face.index:03d}"
             camera_data = bpy.data.cameras.new(name=cam_name)
             camera_data.type = 'ORTHO'
@@ -602,421 +1091,8 @@ class SDE_OT_render_selected_cameras(bpy.types.Operator):
             self.report({'WARNING'}, "Не выделено ни одной камеры, созданной аддоном")
             return {'CANCELLED'}
 
-        # Используем тот же код рендера, но только для выделенных камер
-        return self._render_cameras(context, settings, selected_cameras)
-
-    def _render_cameras(self, context, settings, cameras_to_render):
-        # Аналогичный код как в SDE_OT_render_all_cameras, но для конкретного списка камер
-        # Сохранение исходных настроек
-        original_camera = context.scene.camera
-        original_res_x = context.scene.render.resolution_x
-        original_res_y = context.scene.render.resolution_y
-        original_percentage = context.scene.render.resolution_percentage
-        original_filepath = context.scene.render.filepath
-        original_format = context.scene.render.image_settings.file_format
-        original_mode = context.mode
-
-        # Добавленные сохранения для рендера
-        scene = context.scene
-        original_display_device = scene.display_settings.display_device
-        original_view_transform = scene.view_settings.view_transform
-        
-        # Безопасный поиск 3D viewport для сохранения настроек outline
-        original_show_object_outline = False
-        for screen in bpy.data.screens:
-            for area in screen.areas:
-                if area.type == 'VIEW_3D':
-                    space = area.spaces.active
-                    if hasattr(space, 'shading') and hasattr(space.shading, 'show_object_outline'):
-                        original_show_object_outline = space.shading.show_object_outline
-                        break
-
-        view3d_area = None
-        original_view_persp = None
-        original_show_overlays = True
-        original_shading_type = None
-        original_shading_light = None
-        original_shading_color = None
-        original_wireframe_threshold = None
-        original_show_wireframe = None
-
-        if context.screen:
-            for area in context.screen.areas:
-                if area.type == 'VIEW_3D':
-                    view3d_area = area
-                    space_data = area.spaces.active
-                    original_view_persp = space_data.region_3d.view_perspective
-                    original_show_overlays = space_data.overlay.show_overlays
-                    original_shading_type = space_data.shading.type
-                    original_shading_light = space_data.shading.light
-                    original_shading_color = space_data.shading.color_type
-                    # Сохраняем настройки wireframe
-                    if hasattr(space_data.overlay, 'wireframe_threshold'):
-                        original_wireframe_threshold = space_data.overlay.wireframe_threshold
-                    if hasattr(space_data.overlay, 'show_wireframes'):
-                        original_show_wireframe = space_data.overlay.show_wireframes
-                    break
-
-        wm = context.window_manager
-        rendered_count = 0
-        original_visibility_state = {}
-
-        try:
-            # Переходим в Object Mode
-            if context.mode != 'OBJECT':
-                bpy.ops.object.mode_set(mode='OBJECT')
-
-            # Определяем объект для рендера - ищем меш, а не камеру
-            target_object = context.active_object
-            # Если активный объект - камера, ищем меш по имени камеры
-            if target_object and target_object.type == 'CAMERA':
-                cam_name = target_object.name
-                print(f"[DEBUG] Активная камера: {cam_name}")
-                
-                # Способ 1: извлекаем имя объекта из имени камеры (формат: ObjectName_face_XXX)
-                if '_face_' in cam_name:
-                    object_name = cam_name.split('_face_')[0]
-                    mesh_object = bpy.data.objects.get(object_name)
-                    if mesh_object and mesh_object.type == 'MESH':
-                        target_object = mesh_object
-                        print(f"[DEBUG] Найден меш по имени камеры: {target_object.name}")
-                
-                # Способ 2: ищем через коллекции камер (если первый не сработал)
-                if target_object.type == 'CAMERA':
-                    for collection in bpy.data.collections:
-                        if collection.name.startswith(CAM_COLLECTION_PREFIX) and target_object in collection.objects.values():
-                            # Извлекаем имя объекта из имени коллекции
-                            obj_name_from_collection = collection.name[len(CAM_COLLECTION_PREFIX):]
-                            mesh_object = bpy.data.objects.get(obj_name_from_collection)
-                            if mesh_object and mesh_object.type == 'MESH':
-                                target_object = mesh_object
-                                print(f"[DEBUG] Найден меш через коллекцию: {target_object.name}")
-                                break
-            
-            print(f"[DEBUG] Целевой объект для рендера: {target_object.name if target_object else 'None'}")
-            
-            # Сохраняем исходное состояние видимости всех объектов для восстановления
-            for obj in context.scene.objects:
-                if obj.type == 'MESH':
-                    original_visibility_state[obj.name] = (obj.hide_viewport, obj.hide_render)
-            print("[DEBUG] Используем динамическое управление видимостью для каждой камеры")
-
-            # Настройки рендера
-            if settings.ignore_percentage:
-                context.scene.render.resolution_percentage = 100
-
-            # Специальные настройки для рендера
-            scene.display_settings.display_device = 'sRGB'
-            scene.view_settings.view_transform = 'Standard'
-            
-            # Безопасное отключение outline во всех 3D viewport
-            for screen in bpy.data.screens:
-                for area in screen.areas:
-                    if area.type == 'VIEW_3D':
-                        space = area.spaces.active
-                        if hasattr(space, 'shading') and hasattr(space.shading, 'show_object_outline'):
-                            space.shading.show_object_outline = False
-
-            # Настройки viewport
-            if view3d_area:
-                space_data = view3d_area.spaces.active
-                space_data.shading.type = 'SOLID'
-                space_data.shading.light = 'FLAT'
-                space_data.shading.color_type = 'TEXTURE'
-                # Включаем overlays для wireframe
-                space_data.overlay.show_overlays = True
-                # Настраиваем wireframe
-                if hasattr(space_data.overlay, 'show_wireframes'):
-                    space_data.overlay.show_wireframes = True
-                if hasattr(space_data.overlay, 'wireframe_threshold'):
-                    space_data.overlay.wireframe_threshold = 0.5
-
-            # Создаем папку для рендеров
-            if settings.output_path:
-                output_dir = bpy.path.abspath(settings.output_path)
-            else:
-                output_dir = bpy.path.abspath(get_auto_output_path(target_object.name if target_object else "renders"))
-
-            try:
-                os.makedirs(output_dir, exist_ok=True)
-            except OSError as e:
-                self.report({'ERROR'}, f"Не удалось создать папку {output_dir}: {str(e)}. Используется временная папка")
-                output_dir = os.path.join(bpy.app.tempdir, "renders")
-                os.makedirs(output_dir, exist_ok=True)
-
-            cameras_to_render.sort(key=lambda cam: cam.name)
-            wm.progress_begin(0, len(cameras_to_render))
-
-            # Цикл рендера
-            for i, cam in enumerate(cameras_to_render):
-                try:
-                    print(f"[DEBUG] Рендер камеры: {cam.name}")
-
-                    # Динамическое управление видимостью - показываем только объект этой камеры
-                    current_cam_object = None
-                    # Определяем объект для текущей камеры
-                    cam_name_parts = cam.name.split('_face_')
-                    if len(cam_name_parts) == 2:
-                        current_obj_name = cam_name_parts[0]
-                        current_cam_object = bpy.data.objects.get(current_obj_name)
-                    
-                    # Скрываем все объекты кроме нужного
-                    if current_cam_object:
-                        print(f"[DEBUG] Показываем только объект: {current_cam_object.name}")
-                        for obj in context.scene.objects:
-                            if obj.type == 'MESH':
-                                if obj == current_cam_object:
-                                    obj.hide_viewport = False
-                                    obj.hide_render = False
-                                else:
-                                    obj.hide_viewport = True
-                                    obj.hide_render = True
-                    
-                    # Принудительно обновляем сцену для отображения изменений
-                    context.view_layer.update()
-
-                    # Устанавливаем камеру
-                    context.scene.camera = cam
-                    # Безопасное получение разрешения с проверками
-                    res_x = cam.get(CAM_RES_X_PROP, 1920)
-                    res_y = cam.get(CAM_RES_Y_PROP, 1080)
-                    context.scene.render.resolution_x = res_x
-                    context.scene.render.resolution_y = res_y
-
-                    print(f"[DEBUG] Разрешение: {res_x} x {res_y}")
-                    print(f"[DEBUG] Clipping: {cam.data.clip_start} - {cam.data.clip_end}")
-                    print(f"[DEBUG] Позиция камеры: {cam.location}")
-                    print(f"[DEBUG] Ортографический масштаб: {cam.data.ortho_scale}")
-                    
-                    # Отладка видимости объектов
-                    print(f"[DEBUG] Проверка видимости объектов:")
-                    visible_meshes = []
-                    for obj in context.scene.objects:
-                        if obj.type == 'MESH':
-                            is_visible = not obj.hide_viewport and not obj.hide_render
-                            print(f"[DEBUG]   {obj.name}: viewport={not obj.hide_viewport}, render={not obj.hide_render}, видим={is_visible}")
-                            if is_visible:
-                                visible_meshes.append(obj.name)
-                    print(f"[DEBUG] Видимых мешей: {len(visible_meshes)}: {visible_meshes}")
-                    
-                    # Проверка настроек камеры
-                    print(f"[DEBUG] Камера настройки:")
-                    print(f"[DEBUG]   Тип: {cam.data.type}")
-                    print(f"[DEBUG]   Ортографический масштаб: {cam.data.ortho_scale}")
-                    print(f"[DEBUG]   Направление: {cam.rotation_euler}")
-                    print(f"[DEBUG]   Матрица: {cam.matrix_world}")
-
-                    # Принудительно обновляем сцену
-                    context.view_layer.update()
-                    bpy.context.evaluated_depsgraph_get().update()
-
-                    # Настройка viewport для рендера
-                    if view3d_area:
-                        space_data = view3d_area.spaces.active
-                        space_data.region_3d.view_perspective = 'CAMERA'
-
-                        # Принудительно обновляем viewport
-                        for region in view3d_area.regions:
-                            if region.type == 'WINDOW':
-                                # Перерисовываем область
-                                region.tag_redraw()
-
-                        # Даём время на обновление
-                        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
-
-                    # Проверяем, что камера действительно активна
-                    if context.scene.camera != cam:
-                        print(
-                            f"[ERROR] Камера не установилась! Ожидалась: {cam.name}, получена: {context.scene.camera.name if context.scene.camera else 'None'}")
-                        continue
-
-                    # Подготавливаем файл для сохранения с новым именованием
-                    # Извлекаем информацию из камеры
-                    facade_direction = cam.get(CAM_DIRECTION_PROP, "Неизв")
-                    
-                    # Извлекаем имя объекта и номер фасада из имени камеры
-                    cam_name_parts = cam.name.split('_face_')
-                    if len(cam_name_parts) == 2:
-                        obj_name = cam_name_parts[0]
-                        face_number = cam_name_parts[1]
-                    else:
-                        obj_name = cam.name
-                        face_number = "001"
-                    
-                    # Создаем новое имя файла с версионностью
-                    filename = get_versioned_filename(output_dir, obj_name, face_number, facade_direction)
-                    filepath = os.path.join(output_dir, filename)
-                    context.scene.render.filepath = filepath
-                    context.scene.render.image_settings.file_format = 'PNG'
-                    context.scene.render.image_settings.color_mode = 'RGBA'
-                    context.scene.render.image_settings.color_depth = '8'
-
-                    print(f"[DEBUG] Сохранение в: {filepath}")
-                    print(f"[DEBUG] Имя файла: {filename}")
-                    print(f"[DEBUG] Объект: {obj_name}, Фасад: {face_number}, Направление: {facade_direction}")
-
-                    # Пробуем разные методы рендера
-                    render_success = False
-
-                    # Метод 1: Стандартный OpenGL рендер
-                    try:
-                        print("[DEBUG] Попытка 1: bpy.ops.render.opengl")
-                        bpy.ops.render.opengl(write_still=True)
-
-                        # Проверяем, создался ли файл
-                        if os.path.exists(filepath):
-                            try:
-                                if os.path.getsize(filepath) > MIN_FILE_SIZE:  # Больше 1KB
-                                    render_success = True
-                                    print("[DEBUG] Успех методом 1")
-                            except OSError as e:
-                                print(f"[DEBUG] Не удалось проверить размер файла: {e}")
-                    except Exception as e:
-                        print(f"[DEBUG] Метод 1 неудачен: {e}")
-
-                    # Метод 2: Если первый не сработал, пробуем viewport рендер
-                    if not render_success:
-                        try:
-                            print("[DEBUG] Попытка 2: viewport рендер")
-
-                            # Делаем снимок viewport напрямую
-                            if view3d_area:
-                                # Находим 3D viewport region
-                                for region in view3d_area.regions:
-                                    if region.type == 'WINDOW':
-                                        # Устанавливаем контекст для области
-                                        override = {
-                                            'area': view3d_area,
-                                            'region': region,
-                                            'scene': context.scene,
-                                            'camera': cam
-                                        }
-
-                                        with context.temp_override(**override):
-                                            bpy.ops.render.opengl(write_still=True, view_context=True)
-
-                                        if os.path.exists(filepath):
-                                            try:
-                                                if os.path.getsize(filepath) > MIN_FILE_SIZE:
-                                                    render_success = True
-                                                    print("[DEBUG] Успех методом 2")
-                                            except OSError as e:
-                                                print(f"[DEBUG] Не удалось проверить размер файла: {e}")
-                                        break
-                        except Exception as e:
-                            print(f"[DEBUG] Метод 2 неудачен: {e}")
-
-                    # Метод 3: Ручное сохранение изображения
-                    if not render_success:
-                        try:
-                            print("[DEBUG] Попытка 3: ручное сохранение")
-
-                            # Принудительно рендерим в память
-                            bpy.ops.render.opengl(write_still=False)
-
-                            # Получаем изображение из рендера
-                            image = bpy.data.images.get('Render Result')
-                            if image:
-                                # Сохраняем вручную
-                                image.save_render(filepath)
-                                if os.path.exists(filepath):
-                                    try:
-                                        if os.path.getsize(filepath) > MIN_FILE_SIZE:
-                                            render_success = True
-                                            print("[DEBUG] Успех методом 3")
-                                    except OSError as e:
-                                        print(f"[DEBUG] Не удалось проверить размер файла: {e}")
-                        except Exception as e:
-                            print(f"[DEBUG] Метод 3 неудачен: {e}")
-
-                    if render_success:
-                        rendered_count += 1
-                        print(f"[DEBUG] Камера {cam.name} успешно отрендерена")
-                    else:
-                        print(f"[ERROR] Не удалось отрендерить камеру {cam.name}")
-                        # Создаём пустой файл для отладки
-                        with open(filepath.replace('.png', '_ERROR.txt'), 'w', encoding='utf-8') as f:
-                            f.write(f"Ошибка рендера камеры {cam.name}\n")
-                            f.write(f"Разрешение: {cam.get(CAM_RES_X_PROP, 'N/A')} x {cam.get(CAM_RES_Y_PROP, 'N/A')}\n")
-                            f.write(f"Позиция: {cam.location}\n")
-                            f.write(f"Clipping: {cam.data.clip_start} - {cam.data.clip_end}\n")
-
-                    wm.progress_update(i + 1)
-
-                except Exception as e:
-                    print(f"[ERROR] Критическая ошибка при рендере камеры {cam.name}: {e}")
-                    # Продолжаем с следующей камерой
-                    continue
-
-        except Exception as e:
-            self.report({'ERROR'}, f"Критическая ошибка при рендере: {e}")
-        finally:
-            # Восстановление настроек
-            wm.progress_end()
-
-            # Восстанавливаем видимость объектов
-            for obj_name, original_visibility in original_visibility_state.items():
-                obj = bpy.data.objects.get(obj_name)
-                if obj:
-                    if isinstance(original_visibility, tuple):
-                        obj.hide_viewport, obj.hide_render = original_visibility
-                    else:
-                        # Совместимость со старым форматом
-                        obj.hide_viewport = original_visibility
-
-            context.scene.camera = original_camera
-            context.scene.render.resolution_x = original_res_x
-            context.scene.render.resolution_y = original_res_y
-            context.scene.render.resolution_percentage = original_percentage
-            context.scene.render.filepath = original_filepath
-            context.scene.render.image_settings.file_format = original_format
-
-            # Восстанавливаем специальные настройки
-            scene.display_settings.display_device = original_display_device
-            scene.view_settings.view_transform = original_view_transform
-            
-            # Восстанавливаем outline во всех 3D viewport
-            for screen in bpy.data.screens:
-                for area in screen.areas:
-                    if area.type == 'VIEW_3D':
-                        space = area.spaces.active
-                        if hasattr(space, 'shading') and hasattr(space.shading, 'show_object_outline'):
-                            space.shading.show_object_outline = original_show_object_outline
-
-            # Восстанавливаем режим
-            if original_mode != 'OBJECT' and context.mode == 'OBJECT':
-                try:
-                    if original_mode and '_' in original_mode:
-                        mode_name = original_mode.split('_')[-1]
-                        if mode_name in ['EDIT', 'SCULPT', 'VERTEX_PAINT', 'WEIGHT_PAINT', 'TEXTURE_PAINT']:
-                            bpy.ops.object.mode_set(mode=mode_name)
-                except Exception as e:
-                    print(f"Не удалось восстановить режим {original_mode}: {e}")
-
-            # Восстанавливаем viewport
-            if view3d_area:
-                space_data = view3d_area.spaces.active
-                if original_view_persp:
-                    space_data.region_3d.view_perspective = original_view_persp
-                space_data.overlay.show_overlays = original_show_overlays
-                if original_shading_type:
-                    space_data.shading.type = original_shading_type
-                if original_shading_light:
-                    space_data.shading.light = original_shading_light
-                if original_shading_color:
-                    space_data.shading.color_type = original_shading_color
-                # Восстанавливаем wireframe настройки
-                if original_wireframe_threshold is not None and hasattr(space_data.overlay, 'wireframe_threshold'):
-                    space_data.overlay.wireframe_threshold = original_wireframe_threshold
-                if original_show_wireframe is not None and hasattr(space_data.overlay, 'show_wireframes'):
-                    space_data.overlay.show_wireframes = original_show_wireframe
-
-        if rendered_count > 0:
-            self.report({'INFO'}, f"Рендер завершён: {rendered_count} изображений сохранено в {output_dir}")
-        else:
-            self.report({'WARNING'}, "Ни одно изображение не было отрендерено")
-
-        return {'FINISHED'}
+        # Используем общую функцию рендера
+        return render_cameras_common(self, context, settings, selected_cameras)
 
 
 # ------------------------------------------------------------------------
@@ -1161,383 +1237,24 @@ class SDE_OT_render_all_cameras(bpy.types.Operator):
             self.report({'WARNING'}, "Перед рендером сохраните файл .blend")
             return {'CANCELLED'}
 
-        # Сохранение исходных настроек
-        original_camera = context.scene.camera
-        original_res_x = context.scene.render.resolution_x
-        original_res_y = context.scene.render.resolution_y
-        original_percentage = context.scene.render.resolution_percentage
-        original_filepath = context.scene.render.filepath
-        original_format = context.scene.render.image_settings.file_format
-        original_mode = context.mode
+        # Собираем все камеры из всех коллекций аддона
+        all_cameras = []
+        collections = [c for c in bpy.data.collections if c.name.startswith(CAM_COLLECTION_PREFIX)]
+        for coll in collections:
+            all_cameras.extend([obj for obj in coll.objects if obj.type == 'CAMERA' and CAM_RES_X_PROP in obj])
 
-        # Добавленные сохранения для рендера
-        scene = context.scene
-        original_display_device = scene.display_settings.display_device
-        original_view_transform = scene.view_settings.view_transform
-        
-        # Безопасный поиск 3D viewport для сохранения настроек outline
-        original_show_object_outline = False
-        for screen in bpy.data.screens:
-            for area in screen.areas:
-                if area.type == 'VIEW_3D':
-                    space = area.spaces.active
-                    if hasattr(space, 'shading') and hasattr(space.shading, 'show_object_outline'):
-                        original_show_object_outline = space.shading.show_object_outline
-                        break
+        # Обновляем старые камеры без информации о направлении
+        for cam in all_cameras:
+            if CAM_DIRECTION_PROP not in cam:
+                print(f"[MIGRATION] Обновляем камеру {cam.name} - добавляем информацию о направлении")
+                cam[CAM_DIRECTION_PROP] = "Неизв"  # Для совместимости со старыми камерами
 
-        view3d_area = None
-        original_view_persp = None
-        original_show_overlays = True
-        original_shading_type = None
-        original_shading_light = None
-        original_shading_color = None
-        original_wireframe_threshold = None
-        original_show_wireframe = None
+        if not all_cameras:
+            self.report({'WARNING'}, "Нет камер для рендера")
+            return {'CANCELLED'}
 
-        if context.screen:
-            for area in context.screen.areas:
-                if area.type == 'VIEW_3D':
-                    view3d_area = area
-                    space_data = area.spaces.active
-                    original_view_persp = space_data.region_3d.view_perspective
-                    original_show_overlays = space_data.overlay.show_overlays
-                    original_shading_type = space_data.shading.type
-                    original_shading_light = space_data.shading.light
-                    original_shading_color = space_data.shading.color_type
-                    # Сохраняем настройки wireframe
-                    if hasattr(space_data.overlay, 'wireframe_threshold'):
-                        original_wireframe_threshold = space_data.overlay.wireframe_threshold
-                    if hasattr(space_data.overlay, 'show_wireframes'):
-                        original_show_wireframe = space_data.overlay.show_wireframes
-                    break
-
-        wm = context.window_manager
-        rendered_count = 0
-        original_visibility_state = {}
-
-        try:
-            # Переходим в Object Mode
-            if context.mode != 'OBJECT':
-                bpy.ops.object.mode_set(mode='OBJECT')
-
-            # Запоминаем исходное состояние видимости ВСЕХ объектов
-            target_object = context.active_object
-            for obj in context.scene.objects:
-                original_visibility_state[obj.name] = obj.hide_viewport
-
-            # Программно имитируем Local View: скрываем всё кроме target_object
-            if target_object:
-                for obj in context.scene.objects:
-                    if obj != target_object:
-                        obj.hide_viewport = True
-                    else:
-                        obj.hide_viewport = False
-
-            # Настройки рендера
-            if settings.ignore_percentage:
-                context.scene.render.resolution_percentage = 100
-
-            # Специальные настройки для рендера
-            scene.display_settings.display_device = 'sRGB'
-            scene.view_settings.view_transform = 'Standard'
-            
-            # Безопасное отключение outline во всех 3D viewport
-            for screen in bpy.data.screens:
-                for area in screen.areas:
-                    if area.type == 'VIEW_3D':
-                        space = area.spaces.active
-                        if hasattr(space, 'shading') and hasattr(space.shading, 'show_object_outline'):
-                            space.shading.show_object_outline = False
-
-            # Настройки viewport
-            if view3d_area:
-                space_data = view3d_area.spaces.active
-                space_data.shading.type = 'SOLID'
-                space_data.shading.light = 'FLAT'
-                space_data.shading.color_type = 'TEXTURE'
-                # Включаем overlays для wireframe
-                space_data.overlay.show_overlays = True
-                # Настраиваем wireframe
-                if hasattr(space_data.overlay, 'show_wireframes'):
-                    space_data.overlay.show_wireframes = True
-                if hasattr(space_data.overlay, 'wireframe_threshold'):
-                    space_data.overlay.wireframe_threshold = 0.5
-
-            # Создаем папку для рендеров
-            if settings.output_path:
-                output_dir = bpy.path.abspath(settings.output_path)
-            else:
-                output_dir = bpy.path.abspath(get_auto_output_path(target_object.name if target_object else "renders"))
-
-            try:
-                os.makedirs(output_dir, exist_ok=True)
-            except OSError as e:
-                self.report({'ERROR'}, f"Не удалось создать папку {output_dir}: {str(e)}. Используется временная папка")
-                output_dir = os.path.join(bpy.app.tempdir, "renders")
-                os.makedirs(output_dir, exist_ok=True)
-
-            # Собираем все камеры
-            all_cameras = []
-            collections = [c for c in bpy.data.collections if c.name.startswith(CAM_COLLECTION_PREFIX)]
-            for coll in collections:
-                all_cameras.extend([obj for obj in coll.objects if obj.type == 'CAMERA' and CAM_RES_X_PROP in obj])
-            all_cameras.sort(key=lambda cam: cam.name)
-            
-            # Обновляем старые камеры без информации о направлении
-            for cam in all_cameras:
-                if CAM_DIRECTION_PROP not in cam:
-                    print(f"[MIGRATION] Обновляем камеру {cam.name} - добавляем информацию о направлении")
-                    cam[CAM_DIRECTION_PROP] = "Неизв"  # Для совместимости со старыми камерами
-
-            if not all_cameras:
-                self.report({'WARNING'}, "Нет подходящих камер для рендера")
-                return {'CANCELLED'}
-
-            wm.progress_begin(0, len(all_cameras))
-
-            # Цикл рендера
-            for i, cam in enumerate(all_cameras):
-                try:
-                    print(f"[DEBUG] Рендер камеры: {cam.name}")
-
-                    # Устанавливаем камеру
-                    context.scene.camera = cam
-                    # Безопасное получение разрешения с проверками
-                    res_x = cam.get(CAM_RES_X_PROP, 1920)
-                    res_y = cam.get(CAM_RES_Y_PROP, 1080)
-                    context.scene.render.resolution_x = res_x
-                    context.scene.render.resolution_y = res_y
-
-                    print(f"[DEBUG] Разрешение: {res_x} x {res_y}")
-                    print(f"[DEBUG] Clipping: {cam.data.clip_start} - {cam.data.clip_end}")
-                    print(f"[DEBUG] Позиция камеры: {cam.location}")
-                    print(f"[DEBUG] Ортографический масштаб: {cam.data.ortho_scale}")
-                    
-                    # Отладка видимости объектов
-                    print(f"[DEBUG] Проверка видимости объектов:")
-                    visible_meshes = []
-                    for obj in context.scene.objects:
-                        if obj.type == 'MESH':
-                            is_visible = not obj.hide_viewport and not obj.hide_render
-                            print(f"[DEBUG]   {obj.name}: viewport={not obj.hide_viewport}, render={not obj.hide_render}, видим={is_visible}")
-                            if is_visible:
-                                visible_meshes.append(obj.name)
-                    print(f"[DEBUG] Видимых мешей: {len(visible_meshes)}: {visible_meshes}")
-                    
-                    # Проверка настроек камеры
-                    print(f"[DEBUG] Камера настройки:")
-                    print(f"[DEBUG]   Тип: {cam.data.type}")
-                    print(f"[DEBUG]   Ортографический масштаб: {cam.data.ortho_scale}")
-                    print(f"[DEBUG]   Направление: {cam.rotation_euler}")
-                    print(f"[DEBUG]   Матрица: {cam.matrix_world}")
-
-                    # Принудительно обновляем сцену
-                    context.view_layer.update()
-                    bpy.context.evaluated_depsgraph_get().update()
-
-                    # Настройка viewport для рендера
-                    if view3d_area:
-                        space_data = view3d_area.spaces.active
-                        space_data.region_3d.view_perspective = 'CAMERA'
-
-                        # Принудительно обновляем viewport
-                        for region in view3d_area.regions:
-                            if region.type == 'WINDOW':
-                                # Перерисовываем область
-                                region.tag_redraw()
-
-                        # Даём время на обновление
-                        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
-
-                    # Проверяем, что камера действительно активна
-                    if context.scene.camera != cam:
-                        print(
-                            f"[ERROR] Камера не установилась! Ожидалась: {cam.name}, получена: {context.scene.camera.name if context.scene.camera else 'None'}")
-                        continue
-
-                    # Подготавливаем файл для сохранения с новым именованием
-                    # Извлекаем информацию из камеры
-                    facade_direction = cam.get(CAM_DIRECTION_PROP, "Неизв")
-                    
-                    # Извлекаем имя объекта и номер фасада из имени камеры
-                    cam_name_parts = cam.name.split('_face_')
-                    if len(cam_name_parts) == 2:
-                        obj_name = cam_name_parts[0]
-                        face_number = cam_name_parts[1]
-                    else:
-                        obj_name = cam.name
-                        face_number = "001"
-                    
-                    # Создаем новое имя файла с версионностью
-                    filename = get_versioned_filename(output_dir, obj_name, face_number, facade_direction)
-                    filepath = os.path.join(output_dir, filename)
-                    context.scene.render.filepath = filepath
-                    context.scene.render.image_settings.file_format = 'PNG'
-                    context.scene.render.image_settings.color_mode = 'RGBA'
-                    context.scene.render.image_settings.color_depth = '8'
-
-                    print(f"[DEBUG] Сохранение в: {filepath}")
-                    print(f"[DEBUG] Имя файла: {filename}")
-                    print(f"[DEBUG] Объект: {obj_name}, Фасад: {face_number}, Направление: {facade_direction}")
-
-                    # Пробуем разные методы рендера
-                    render_success = False
-
-                    # Метод 1: Стандартный OpenGL рендер
-                    try:
-                        print("[DEBUG] Попытка 1: bpy.ops.render.opengl")
-                        bpy.ops.render.opengl(write_still=True)
-
-                        # Проверяем, создался ли файл
-                        if os.path.exists(filepath):
-                            try:
-                                if os.path.getsize(filepath) > MIN_FILE_SIZE:  # Больше 1KB
-                                    render_success = True
-                                    print("[DEBUG] Успех методом 1")
-                            except OSError as e:
-                                print(f"[DEBUG] Не удалось проверить размер файла: {e}")
-                    except Exception as e:
-                        print(f"[DEBUG] Метод 1 неудачен: {e}")
-
-                    # Метод 2: Если первый не сработал, пробуем viewport рендер
-                    if not render_success:
-                        try:
-                            print("[DEBUG] Попытка 2: viewport рендер")
-
-                            # Делаем снимок viewport напрямую
-                            if view3d_area:
-                                # Находим 3D viewport region
-                                for region in view3d_area.regions:
-                                    if region.type == 'WINDOW':
-                                        # Устанавливаем контекст для области
-                                        override = {
-                                            'area': view3d_area,
-                                            'region': region,
-                                            'scene': context.scene,
-                                            'camera': cam
-                                        }
-
-                                        with context.temp_override(**override):
-                                            bpy.ops.render.opengl(write_still=True, view_context=True)
-
-                                        if os.path.exists(filepath):
-                                            try:
-                                                if os.path.getsize(filepath) > MIN_FILE_SIZE:
-                                                    render_success = True
-                                                    print("[DEBUG] Успех методом 2")
-                                            except OSError as e:
-                                                print(f"[DEBUG] Не удалось проверить размер файла: {e}")
-                                        break
-                        except Exception as e:
-                            print(f"[DEBUG] Метод 2 неудачен: {e}")
-
-                    # Метод 3: Ручное сохранение изображения
-                    if not render_success:
-                        try:
-                            print("[DEBUG] Попытка 3: ручное сохранение")
-
-                            # Принудительно рендерим в память
-                            bpy.ops.render.opengl(write_still=False)
-
-                            # Получаем изображение из рендера
-                            image = bpy.data.images.get('Render Result')
-                            if image:
-                                # Сохраняем вручную
-                                image.save_render(filepath)
-                                if os.path.exists(filepath):
-                                    try:
-                                        if os.path.getsize(filepath) > MIN_FILE_SIZE:
-                                            render_success = True
-                                            print("[DEBUG] Успех методом 3")
-                                    except OSError as e:
-                                        print(f"[DEBUG] Не удалось проверить размер файла: {e}")
-                        except Exception as e:
-                            print(f"[DEBUG] Метод 3 неудачен: {e}")
-
-                    if render_success:
-                        rendered_count += 1
-                        print(f"[DEBUG] Камера {cam.name} успешно отрендерена")
-                    else:
-                        print(f"[ERROR] Не удалось отрендерить камеру {cam.name}")
-                        # Создаём пустой файл для отладки
-                        with open(filepath.replace('.png', '_ERROR.txt'), 'w', encoding='utf-8') as f:
-                            f.write(f"Ошибка рендера камеры {cam.name}\n")
-                            f.write(f"Разрешение: {cam.get(CAM_RES_X_PROP, 'N/A')} x {cam.get(CAM_RES_Y_PROP, 'N/A')}\n")
-                            f.write(f"Позиция: {cam.location}\n")
-                            f.write(f"Clipping: {cam.data.clip_start} - {cam.data.clip_end}\n")
-
-                    wm.progress_update(i + 1)
-
-                except Exception as e:
-                    print(f"[ERROR] Критическая ошибка при рендере камеры {cam.name}: {e}")
-                    # Продолжаем с следующей камерой
-                    continue
-
-        except Exception as e:
-            self.report({'ERROR'}, f"Критическая ошибка при рендере: {e}")
-        finally:
-            # Восстановление настроек
-            wm.progress_end()
-
-            # ВАЖНО: Восстанавливаем исходное состояние видимости всех объектов
-            for obj_name, original_visibility in original_visibility_state.items():
-                obj = bpy.data.objects.get(obj_name)
-                if obj:
-                    obj.hide_viewport = original_visibility
-
-            context.scene.camera = original_camera
-            context.scene.render.resolution_x = original_res_x
-            context.scene.render.resolution_y = original_res_y
-            context.scene.render.resolution_percentage = original_percentage
-            context.scene.render.filepath = original_filepath
-            context.scene.render.image_settings.file_format = original_format
-
-            # Восстанавливаем специальные настройки
-            scene.display_settings.display_device = original_display_device
-            scene.view_settings.view_transform = original_view_transform
-            
-            # Восстанавливаем outline во всех 3D viewport
-            for screen in bpy.data.screens:
-                for area in screen.areas:
-                    if area.type == 'VIEW_3D':
-                        space = area.spaces.active
-                        if hasattr(space, 'shading') and hasattr(space.shading, 'show_object_outline'):
-                            space.shading.show_object_outline = original_show_object_outline
-
-            # Восстанавливаем режим
-            if original_mode != 'OBJECT' and context.mode == 'OBJECT':
-                try:
-                    if original_mode and '_' in original_mode:
-                        mode_name = original_mode.split('_')[-1]
-                        if mode_name in ['EDIT', 'SCULPT', 'VERTEX_PAINT', 'WEIGHT_PAINT', 'TEXTURE_PAINT']:
-                            bpy.ops.object.mode_set(mode=mode_name)
-                except Exception as e:
-                    print(f"Не удалось восстановить режим {original_mode}: {e}")
-
-            # Восстанавливаем viewport (убрал код с local view)
-            if view3d_area:
-                space_data = view3d_area.spaces.active
-                if original_view_persp:
-                    space_data.region_3d.view_perspective = original_view_persp
-                space_data.overlay.show_overlays = original_show_overlays
-                if original_shading_type:
-                    space_data.shading.type = original_shading_type
-                if original_shading_light:
-                    space_data.shading.light = original_shading_light
-                if original_shading_color:
-                    space_data.shading.color_type = original_shading_color
-                # Восстанавливаем wireframe настройки
-                if original_wireframe_threshold is not None and hasattr(space_data.overlay, 'wireframe_threshold'):
-                    space_data.overlay.wireframe_threshold = original_wireframe_threshold
-                if original_show_wireframe is not None and hasattr(space_data.overlay, 'show_wireframes'):
-                    space_data.overlay.show_wireframes = original_show_wireframe
-
-        if rendered_count > 0:
-            self.report({'INFO'}, f"Рендер завершён: {rendered_count} изображений сохранено в {output_dir}")
-        else:
-            self.report({'WARNING'}, "Ни одно изображение не было отрендерено")
-
-        return {'FINISHED'}
+        # Используем общую функцию рендера
+        return render_cameras_common(self, context, settings, all_cameras)
 
 
 # ------------------------------------------------------------------------
