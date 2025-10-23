@@ -23,6 +23,15 @@ CAM_RES_X_PROP = "sde_resolution_x"
 CAM_RES_Y_PROP = "sde_resolution_y"
 CAM_DIRECTION_PROP = "sde_facade_direction"  # Сохраняет сторону света фасада
 
+# Константы для математических расчетов
+VERTICAL_THRESHOLD = 0.001  # Порог для определения вертикальных поверхностей (крыши/полы)
+ANGLE_45_DEGREES = 0.707    # cos(45°) для определения направления нормали вверх/вниз
+FRAME_PADDING = 1.05        # 5% отступ вокруг объекта в кадре
+MIN_FILE_SIZE = 1000        # Минимальный размер файла для считания рендера успешным (байты)
+MIN_CLIPPING_RANGE = 1.0    # Минимальный диапазон между clip_start и clip_end (метры)
+DEFAULT_CLIPPING_START = 0.1    # Значение clipping start по умолчанию
+DEFAULT_CLIPPING_END = 1000.0   # Значение clipping end по умолчанию
+
 
 # Функция автоматического создания имени папки
 def get_auto_output_path(obj_name):
@@ -41,7 +50,7 @@ def get_cardinal_direction(face_normal_world):
     y = face_normal_world.y
     
     # Проверяем на случай вертикальных поверхностей (крыши, полы)
-    if abs(x) < 0.001 and abs(y) < 0.001:
+    if abs(x) < VERTICAL_THRESHOLD and abs(y) < VERTICAL_THRESHOLD:
         print(f"[DIRECTION DEBUG] Вертикальная поверхность обнаружена (Z={face_normal_world.z:.3f})")
         return "Верт"  # Вертикальная поверхность (крыша/пол)
     
@@ -143,7 +152,7 @@ def calculate_clipping_planes(obj, camera_location, camera_direction):
         bm.free()
 
         if not world_vertices:
-            return 0.1, 1000.0
+            return DEFAULT_CLIPPING_START, DEFAULT_CLIPPING_END
 
         # Проецируем все вершины на направление камеры
         camera_dir_normalized = camera_direction.normalized()
@@ -158,7 +167,7 @@ def calculate_clipping_planes(obj, camera_location, camera_direction):
             distances.append(distance)
 
         if not distances:
-            return 0.1, 1000.0
+            return DEFAULT_CLIPPING_START, DEFAULT_CLIPPING_END
 
         min_distance = min(distances)
         max_distance = max(distances)
@@ -183,17 +192,17 @@ def calculate_clipping_planes(obj, camera_location, camera_direction):
             clip_end = max(10.0, abs(min_distance) + 5.0)
 
         # Проверяем минимальный диапазон между start и end
-        if clip_end - clip_start < 1.0:
+        if clip_end - clip_start < MIN_CLIPPING_RANGE:
             clip_end = clip_start + 10.0  # Минимальный диапазон 10 метров вместо 1000
 
         return clip_start, clip_end
 
     except (AttributeError, ValueError, TypeError) as e:
         print(f"Ошибка при расчёте clipping planes: {e}")
-        return 0.1, 1000.0
+        return DEFAULT_CLIPPING_START, DEFAULT_CLIPPING_END
     except Exception as e:
         print(f"Неожиданная ошибка при расчёте clipping planes: {e}")
-        return 0.1, 1000.0
+        return DEFAULT_CLIPPING_START, DEFAULT_CLIPPING_END
 
 
 # ------------------------------------------------------------------------
@@ -463,9 +472,14 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
             if not all_verts or len(all_verts) == 0:
                 print("Ошибка: объект не содержит вершин")
                 return None
-                
+
             face_normal_world = (world_matrix.to_3x3() @ face.normal).normalized()
             face_center = world_matrix @ face.calc_center_median()
+
+            # Дополнительная проверка перед делением
+            if len(all_verts) == 0:
+                return None
+
             centroid = sum([world_matrix @ v.co for v in all_verts], Vector()) / len(all_verts)
             centroid_proj = (centroid - face_center).dot(face_normal_world)
 
@@ -477,7 +491,7 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
                 centroid_proj = (centroid - face_center).dot(face_normal_world)
 
             z_dot = face_normal_world.dot(Vector((0, 0, 1)))
-            if abs(z_dot) > 0.707 and z_dot < 0:
+            if abs(z_dot) > ANGLE_45_DEGREES and z_dot < 0:
                 face_normal_world = -face_normal_world
                 projs = [-p for p in projs]
 
@@ -512,7 +526,7 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
             offset = rotation_mat @ Vector((center_x, center_y, 0))
             final_location = initial_location + offset
 
-            padding = 1.05
+            padding = FRAME_PADDING
 
             effective_max_res = self.max_resolution
             content_aspect = width / height if height != 0 else 1.0
@@ -626,21 +640,22 @@ class SDE_OT_render_selected_cameras(bpy.types.Operator):
         original_wireframe_threshold = None
         original_show_wireframe = None
 
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                view3d_area = area
-                space_data = area.spaces.active
-                original_view_persp = space_data.region_3d.view_perspective
-                original_show_overlays = space_data.overlay.show_overlays
-                original_shading_type = space_data.shading.type
-                original_shading_light = space_data.shading.light
-                original_shading_color = space_data.shading.color_type
-                # Сохраняем настройки wireframe
-                if hasattr(space_data.overlay, 'wireframe_threshold'):
-                    original_wireframe_threshold = space_data.overlay.wireframe_threshold
-                if hasattr(space_data.overlay, 'show_wireframes'):
-                    original_show_wireframe = space_data.overlay.show_wireframes
-                break
+        if context.screen:
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    view3d_area = area
+                    space_data = area.spaces.active
+                    original_view_persp = space_data.region_3d.view_perspective
+                    original_show_overlays = space_data.overlay.show_overlays
+                    original_shading_type = space_data.shading.type
+                    original_shading_light = space_data.shading.light
+                    original_shading_color = space_data.shading.color_type
+                    # Сохраняем настройки wireframe
+                    if hasattr(space_data.overlay, 'wireframe_threshold'):
+                        original_wireframe_threshold = space_data.overlay.wireframe_threshold
+                    if hasattr(space_data.overlay, 'show_wireframes'):
+                        original_show_wireframe = space_data.overlay.show_wireframes
+                    break
 
         wm = context.window_manager
         rendered_count = 0
@@ -851,7 +866,7 @@ class SDE_OT_render_selected_cameras(bpy.types.Operator):
                         # Проверяем, создался ли файл
                         if os.path.exists(filepath):
                             try:
-                                if os.path.getsize(filepath) > 1000:  # Больше 1KB
+                                if os.path.getsize(filepath) > MIN_FILE_SIZE:  # Больше 1KB
                                     render_success = True
                                     print("[DEBUG] Успех методом 1")
                             except OSError as e:
@@ -882,7 +897,7 @@ class SDE_OT_render_selected_cameras(bpy.types.Operator):
 
                                         if os.path.exists(filepath):
                                             try:
-                                                if os.path.getsize(filepath) > 1000:
+                                                if os.path.getsize(filepath) > MIN_FILE_SIZE:
                                                     render_success = True
                                                     print("[DEBUG] Успех методом 2")
                                             except OSError as e:
@@ -906,7 +921,7 @@ class SDE_OT_render_selected_cameras(bpy.types.Operator):
                                 image.save_render(filepath)
                                 if os.path.exists(filepath):
                                     try:
-                                        if os.path.getsize(filepath) > 1000:
+                                        if os.path.getsize(filepath) > MIN_FILE_SIZE:
                                             render_success = True
                                             print("[DEBUG] Успех методом 3")
                                     except OSError as e:
@@ -920,7 +935,7 @@ class SDE_OT_render_selected_cameras(bpy.types.Operator):
                     else:
                         print(f"[ERROR] Не удалось отрендерить камеру {cam.name}")
                         # Создаём пустой файл для отладки
-                        with open(filepath.replace('.png', '_ERROR.txt'), 'w') as f:
+                        with open(filepath.replace('.png', '_ERROR.txt'), 'w', encoding='utf-8') as f:
                             f.write(f"Ошибка рендера камеры {cam.name}\n")
                             f.write(f"Разрешение: {cam.get(CAM_RES_X_PROP, 'N/A')} x {cam.get(CAM_RES_Y_PROP, 'N/A')}\n")
                             f.write(f"Позиция: {cam.location}\n")
@@ -1179,21 +1194,22 @@ class SDE_OT_render_all_cameras(bpy.types.Operator):
         original_wireframe_threshold = None
         original_show_wireframe = None
 
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                view3d_area = area
-                space_data = area.spaces.active
-                original_view_persp = space_data.region_3d.view_perspective
-                original_show_overlays = space_data.overlay.show_overlays
-                original_shading_type = space_data.shading.type
-                original_shading_light = space_data.shading.light
-                original_shading_color = space_data.shading.color_type
-                # Сохраняем настройки wireframe
-                if hasattr(space_data.overlay, 'wireframe_threshold'):
-                    original_wireframe_threshold = space_data.overlay.wireframe_threshold
-                if hasattr(space_data.overlay, 'show_wireframes'):
-                    original_show_wireframe = space_data.overlay.show_wireframes
-                break
+        if context.screen:
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    view3d_area = area
+                    space_data = area.spaces.active
+                    original_view_persp = space_data.region_3d.view_perspective
+                    original_show_overlays = space_data.overlay.show_overlays
+                    original_shading_type = space_data.shading.type
+                    original_shading_light = space_data.shading.light
+                    original_shading_color = space_data.shading.color_type
+                    # Сохраняем настройки wireframe
+                    if hasattr(space_data.overlay, 'wireframe_threshold'):
+                        original_wireframe_threshold = space_data.overlay.wireframe_threshold
+                    if hasattr(space_data.overlay, 'show_wireframes'):
+                        original_show_wireframe = space_data.overlay.show_wireframes
+                    break
 
         wm = context.window_manager
         rendered_count = 0
@@ -1375,7 +1391,7 @@ class SDE_OT_render_all_cameras(bpy.types.Operator):
                         # Проверяем, создался ли файл
                         if os.path.exists(filepath):
                             try:
-                                if os.path.getsize(filepath) > 1000:  # Больше 1KB
+                                if os.path.getsize(filepath) > MIN_FILE_SIZE:  # Больше 1KB
                                     render_success = True
                                     print("[DEBUG] Успех методом 1")
                             except OSError as e:
@@ -1406,7 +1422,7 @@ class SDE_OT_render_all_cameras(bpy.types.Operator):
 
                                         if os.path.exists(filepath):
                                             try:
-                                                if os.path.getsize(filepath) > 1000:
+                                                if os.path.getsize(filepath) > MIN_FILE_SIZE:
                                                     render_success = True
                                                     print("[DEBUG] Успех методом 2")
                                             except OSError as e:
@@ -1430,7 +1446,7 @@ class SDE_OT_render_all_cameras(bpy.types.Operator):
                                 image.save_render(filepath)
                                 if os.path.exists(filepath):
                                     try:
-                                        if os.path.getsize(filepath) > 1000:
+                                        if os.path.getsize(filepath) > MIN_FILE_SIZE:
                                             render_success = True
                                             print("[DEBUG] Успех методом 3")
                                     except OSError as e:
@@ -1444,7 +1460,7 @@ class SDE_OT_render_all_cameras(bpy.types.Operator):
                     else:
                         print(f"[ERROR] Не удалось отрендерить камеру {cam.name}")
                         # Создаём пустой файл для отладки
-                        with open(filepath.replace('.png', '_ERROR.txt'), 'w') as f:
+                        with open(filepath.replace('.png', '_ERROR.txt'), 'w', encoding='utf-8') as f:
                             f.write(f"Ошибка рендера камеры {cam.name}\n")
                             f.write(f"Разрешение: {cam.get(CAM_RES_X_PROP, 'N/A')} x {cam.get(CAM_RES_Y_PROP, 'N/A')}\n")
                             f.write(f"Позиция: {cam.location}\n")
@@ -1633,7 +1649,12 @@ class SDE_OT_render_vulkan_compatible(bpy.types.Operator):
             else:
                 output_dir = bpy.path.abspath(get_auto_output_path(target_object.name if target_object else "renders"))
 
-            os.makedirs(output_dir, exist_ok=True)
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except OSError as e:
+                self.report({'ERROR'}, f"Не удалось создать папку {output_dir}: {str(e)}. Используется временная папка")
+                output_dir = os.path.join(bpy.app.tempdir, "renders")
+                os.makedirs(output_dir, exist_ok=True)
 
             cameras_to_render.sort(key=lambda cam: cam.name)
             wm.progress_begin(0, len(cameras_to_render))
@@ -1674,7 +1695,7 @@ class SDE_OT_render_vulkan_compatible(bpy.types.Operator):
                     # Используем стандартный рендер вместо OpenGL
                     bpy.ops.render.render(write_still=True)
 
-                    if os.path.exists(filepath) and os.path.getsize(filepath) > 1000:
+                    if os.path.exists(filepath) and os.path.getsize(filepath) > MIN_FILE_SIZE:
                         rendered_count += 1
                         print(f"[VULKAN DEBUG] Камера {cam.name} успешно отрендерена")
                     else:
@@ -1730,10 +1751,11 @@ class SDE_OT_preview_camera(bpy.types.Operator):
 
     def execute(self, context):
         try:
-            for area in context.screen.areas:
-                if area.type == 'VIEW_3D':
-                    area.spaces.active.region_3d.view_perspective = 'CAMERA'
-                    break
+            if context.screen:
+                for area in context.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        area.spaces.active.region_3d.view_perspective = 'CAMERA'
+                        break
             return {'FINISHED'}
         except Exception as e:
             self.report({'ERROR'}, f"Ошибка при переключении в вид камеры: {e}")
