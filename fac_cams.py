@@ -978,15 +978,23 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
             original_normal = face_normal_world.copy()
 
             # Проверяем ориентацию нормали относительно вертикали
-            # Для крыш и полов может потребоваться специальная обработка
+            # ВАЖНО: Инвертируем ТОЛЬКО для горизонтальных полов, не для наклонных поверхностей!
             z_component = face_normal_world.z
 
-            # Если это пол (нормаль смотрит вниз), инвертируем ее
-            # чтобы камера располагалась сверху и смотрела вниз
-            if abs(z_component) > ANGLE_45_DEGREES and z_component < 0:
+            # Для истинно горизонтального пола (нормаль почти строго вниз):
+            # - z < -0.707 (более 45° вниз)
+            # - x и y компоненты малы (поверхность горизонтальна)
+            # Тогда инвертируем нормаль, чтобы камера была сверху и смотрела вниз
+            is_horizontal = abs(face_normal_world.x) < 0.1 and abs(face_normal_world.y) < 0.1
+            is_floor = abs(z_component) > ANGLE_45_DEGREES and z_component < 0
+
+            if is_floor and is_horizontal:
                 face_normal_world = -face_normal_world
-                print(f"[CAMERA DEBUG] Пол обнаружен (Z < 0), нормаль инвертирована")
+                print(f"[CAMERA DEBUG] Горизонтальный пол обнаружен, нормаль инвертирована")
                 print(f"[CAMERA DEBUG] Новая нормаль: ({face_normal_world.x:.3f}, {face_normal_world.y:.3f}, {face_normal_world.z:.3f})")
+            elif is_floor and not is_horizontal:
+                print(f"[CAMERA DEBUG] Наклонная поверхность (не пол), инверсия НЕ применяется")
+                print(f"[CAMERA DEBUG] X={face_normal_world.x:.3f}, Y={face_normal_world.y:.3f} - поверхность наклонена")
 
             # Вычисляем проекции всех вершин на нормаль для расчета расстояния
             projs = [(world_matrix @ v.co - face_center).dot(face_normal_world) for v in all_verts]
