@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Быстрые фасады",
     "author": "Максим Ефанов",
-    "version": (6, 7, 0),
+    "version": (6, 8, 0),
     "blender": (4, 5, 0),
     "location": "3D View > N-панель > Быстрые фасады",
     "description": "Создаёт камеры по полигонам для рендера фасадов с автоматическим расчётом расстояния, clipping planes и созданием папок, рендером выделенных камер, рендером камер объекта и управлением по объектам. Добавлены специальные рендер-настройки и пользовательские пресеты.",
@@ -940,13 +940,11 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
             if cam_rotation_quat is not None:
                 camera_obj.rotation_euler = cam_rotation_quat.to_euler()
             else:
-                print("Предупреждение: не удалось установить поворот камеры")
+                print(f"[ERROR] Не удалось установить поворот камеры {cam_name}")
 
             camera_obj[CAM_RES_X_PROP] = res_x
             camera_obj[CAM_RES_Y_PROP] = res_y
             camera_obj[CAM_DIRECTION_PROP] = facade_direction
-            
-            print(f"[CAMERA CREATE] {cam_name} - направление: {facade_direction}")
 
             cam_collection.objects.link(camera_obj)
             created_cameras.append(camera_obj)
@@ -962,29 +960,35 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
                 print("Ошибка: объект не содержит вершин")
                 return None
 
+            # Получаем нормаль полигона в мировых координатах
+            # По стандарту Blender нормаль направлена "наружу" от поверхности
             face_normal_world = (world_matrix.to_3x3() @ face.normal).normalized()
             face_center = world_matrix @ face.calc_center_median()
 
-            # Дополнительная проверка перед делением
-            if len(all_verts) == 0:
-                return None
+            # Проверяем ориентацию нормали относительно вертикали
+            # ВАЖНО: Инвертируем ТОЛЬКО для горизонтальных полов, не для наклонных поверхностей!
+            z_component = face_normal_world.z
 
-            centroid = sum([world_matrix @ v.co for v in all_verts], Vector()) / len(all_verts)
-            centroid_proj = (centroid - face_center).dot(face_normal_world)
+            # Для истинно горизонтального пола (нормаль почти строго вниз):
+            # - z < -0.707 (более 45° вниз)
+            # - x и y компоненты малы (поверхность горизонтальна)
+            # Тогда инвертируем нормаль, чтобы камера была сверху и смотрела вниз
+            is_horizontal = abs(face_normal_world.x) < 0.1 and abs(face_normal_world.y) < 0.1
+            is_floor = abs(z_component) > ANGLE_45_DEGREES and z_component < 0
 
+            if is_floor and is_horizontal:
+                # Только для истинно горизонтальных полов инвертируем нормаль
+                face_normal_world = -face_normal_world
+
+            # Вычисляем проекции всех вершин на нормаль для расчета расстояния
             projs = [(world_matrix @ v.co - face_center).dot(face_normal_world) for v in all_verts]
 
-            if centroid_proj > 0:
-                face_normal_world = -face_normal_world
-                projs = [-p for p in projs]
-                centroid_proj = (centroid - face_center).dot(face_normal_world)
-
-            z_dot = face_normal_world.dot(Vector((0, 0, 1)))
-            if abs(z_dot) > ANGLE_45_DEGREES and z_dot < 0:
-                face_normal_world = -face_normal_world
-                projs = [-p for p in projs]
-
-            rotation = (-face_normal_world).to_track_quat('-Z', 'Y')
+            # ВАЖНО: В Blender камера смотрит вдоль локальной оси -Z
+            # Нормаль (face_normal_world) указывает ОТ поверхности
+            # Камера должна смотреть НА поверхность (против нормали)
+            # to_track_quat('Z', 'Y') выравнивает +Z вдоль нормали, тогда -Z смотрит против нормали
+            rotation = face_normal_world.to_track_quat('Z', 'Y')
+            rotation_mat = rotation.to_matrix()
 
             if self.auto_distance:
                 min_proj = min(projs)
@@ -993,9 +997,10 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
             else:
                 final_distance = self.distance
 
+            # Позиция камеры = центр полигона + нормаль * расстояние
             initial_location = face_center + face_normal_world * final_distance
 
-            view_matrix = (Matrix.Translation(initial_location) @ rotation.to_matrix().to_4x4()).inverted()
+            view_matrix = (Matrix.Translation(initial_location) @ rotation_mat.to_4x4()).inverted()
             projected_points = [view_matrix @ v for v in vertices]
 
             min_x = min(p.x for p in projected_points)
@@ -1011,7 +1016,6 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
             center_x = (min_x + max_x) / 2
             center_y = (min_y + max_y) / 2
 
-            rotation_mat = rotation.to_matrix()
             offset = rotation_mat @ Vector((center_x, center_y, 0))
             final_location = initial_location + offset
 
@@ -1035,7 +1039,8 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
 
             # Рассчитываем clipping planes
             if self.auto_clipping:
-                camera_direction = -face_normal_world  # Направление взгляда камеры
+                # Направление взгляда камеры - против нормали (камера смотрит на поверхность)
+                camera_direction = -face_normal_world
                 clip_start, clip_end = calculate_clipping_planes(obj, final_location, camera_direction)
             else:
                 # Значения по умолчанию
