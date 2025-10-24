@@ -938,15 +938,18 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
             camera_obj = bpy.data.objects.new(name=cam_name, object_data=camera_data)
             camera_obj.location = final_cam_location
             if cam_rotation_quat is not None:
-                camera_obj.rotation_euler = cam_rotation_quat.to_euler()
+                euler = cam_rotation_quat.to_euler()
+                camera_obj.rotation_euler = euler
+                print(f"[CAMERA CREATE] {cam_name}")
+                print(f"  Позиция: ({final_cam_location.x:.3f}, {final_cam_location.y:.3f}, {final_cam_location.z:.3f})")
+                print(f"  Rotation Euler (deg): ({math.degrees(euler.x):.1f}, {math.degrees(euler.y):.1f}, {math.degrees(euler.z):.1f})")
+                print(f"  Направление фасада: {facade_direction}")
             else:
-                print("Предупреждение: не удалось установить поворот камеры")
+                print("[CAMERA ERROR] Не удалось установить поворот камеры")
 
             camera_obj[CAM_RES_X_PROP] = res_x
             camera_obj[CAM_RES_Y_PROP] = res_y
             camera_obj[CAM_DIRECTION_PROP] = facade_direction
-            
-            print(f"[CAMERA CREATE] {cam_name} - направление: {facade_direction}")
 
             cam_collection.objects.link(camera_obj)
             created_cameras.append(camera_obj)
@@ -967,7 +970,12 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
             face_normal_world = (world_matrix.to_3x3() @ face.normal).normalized()
             face_center = world_matrix @ face.calc_center_median()
 
-            print(f"[CAMERA DEBUG] Полигон {face.index}: исходная нормаль = ({face_normal_world.x:.3f}, {face_normal_world.y:.3f}, {face_normal_world.z:.3f})")
+            print(f"\n[CAMERA DEBUG] ===== Полигон {face.index} =====")
+            print(f"[CAMERA DEBUG] Исходная нормаль: ({face_normal_world.x:.3f}, {face_normal_world.y:.3f}, {face_normal_world.z:.3f})")
+            print(f"[CAMERA DEBUG] Центр полигона: ({face_center.x:.3f}, {face_center.y:.3f}, {face_center.z:.3f})")
+
+            # Сохраняем исходную нормаль для отладки
+            original_normal = face_normal_world.copy()
 
             # Проверяем ориентацию нормали относительно вертикали
             # Для крыш и полов может потребоваться специальная обработка
@@ -977,27 +985,45 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
             # чтобы камера располагалась сверху и смотрела вниз
             if abs(z_component) > ANGLE_45_DEGREES and z_component < 0:
                 face_normal_world = -face_normal_world
-                print(f"[CAMERA DEBUG] Пол обнаружен, нормаль инвертирована для правильного размещения камеры")
+                print(f"[CAMERA DEBUG] Пол обнаружен (Z < 0), нормаль инвертирована")
+                print(f"[CAMERA DEBUG] Новая нормаль: ({face_normal_world.x:.3f}, {face_normal_world.y:.3f}, {face_normal_world.z:.3f})")
 
             # Вычисляем проекции всех вершин на нормаль для расчета расстояния
             projs = [(world_matrix @ v.co - face_center).dot(face_normal_world) for v in all_verts]
 
-            # Создаем поворот камеры:
-            # - Нормаль (face_normal_world) указывает ОТ поверхности наружу
-            # - Камера должна смотреть НА поверхность (против нормали)
-            # - Ось +Z камеры выравниваем вдоль нормали, тогда -Z (направление взгляда) смотрит против нормали
+            # ВАЖНО: В Blender камера смотрит вдоль локальной оси -Z
+            # Нормаль (face_normal_world) указывает ОТ поверхности
+            # Камера должна смотреть НА поверхность (против нормали)
+            #
+            # to_track_quat('Z', 'Y') выравнивает локальную ось +Z вдоль вектора
+            # Это означает что локальная ось -Z будет противоположно вектору
+            # Поэтому camera -Z (направление взгляда) будет против нормали ✓
             rotation = face_normal_world.to_track_quat('Z', 'Y')
+
+            # Проверяем результат поворота
+            rotation_mat = rotation.to_matrix()
+            camera_forward = rotation_mat @ Vector((0, 0, -1))  # Локальная ось -Z после поворота
+            camera_up = rotation_mat @ Vector((0, 1, 0))  # Локальная ось +Y после поворота
+
+            print(f"[CAMERA DEBUG] Направление взгляда камеры: ({camera_forward.x:.3f}, {camera_forward.y:.3f}, {camera_forward.z:.3f})")
+            print(f"[CAMERA DEBUG] Ожидаемое направление (против нормали): ({-face_normal_world.x:.3f}, {-face_normal_world.y:.3f}, {-face_normal_world.z:.3f})")
+            print(f"[CAMERA DEBUG] Направления совпадают: {camera_forward.dot(-face_normal_world) > 0.99}")
 
             if self.auto_distance:
                 min_proj = min(projs)
                 buffer = max(10.0, -min_proj * 0.1)
                 final_distance = max(self.distance, -min_proj + buffer)
+                print(f"[CAMERA DEBUG] Auto distance: {final_distance:.3f} (min_proj: {min_proj:.3f}, buffer: {buffer:.3f})")
             else:
                 final_distance = self.distance
+                print(f"[CAMERA DEBUG] Manual distance: {final_distance:.3f}")
 
+            # Позиция камеры = центр полигона + нормаль * расстояние
+            # Камера размещается В НАПРАВЛЕНИИ нормали (от поверхности)
             initial_location = face_center + face_normal_world * final_distance
+            print(f"[CAMERA DEBUG] Начальная позиция камеры: ({initial_location.x:.3f}, {initial_location.y:.3f}, {initial_location.z:.3f})")
 
-            view_matrix = (Matrix.Translation(initial_location) @ rotation.to_matrix().to_4x4()).inverted()
+            view_matrix = (Matrix.Translation(initial_location) @ rotation_mat.to_4x4()).inverted()
             projected_points = [view_matrix @ v for v in vertices]
 
             min_x = min(p.x for p in projected_points)
@@ -1008,14 +1034,16 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
             width = max_x - min_x
             height = max_y - min_y
             if width <= 0 or height <= 0:
+                print(f"[CAMERA ERROR] Некорректные размеры кадра: width={width:.3f}, height={height:.3f}")
                 return None
 
             center_x = (min_x + max_x) / 2
             center_y = (min_y + max_y) / 2
 
-            rotation_mat = rotation.to_matrix()
             offset = rotation_mat @ Vector((center_x, center_y, 0))
             final_location = initial_location + offset
+            print(f"[CAMERA DEBUG] Финальная позиция камеры (с offset): ({final_location.x:.3f}, {final_location.y:.3f}, {final_location.z:.3f})")
+            print(f"[CAMERA DEBUG] Offset: ({offset.x:.3f}, {offset.y:.3f}, {offset.z:.3f})")
 
             padding = FRAME_PADDING
 
