@@ -55,6 +55,9 @@ coverage.xml
 *.blend3
 *.blend@
 
+# Release files
+release/
+
 # Temporary files
 *.tmp
 *.bak
