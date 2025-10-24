@@ -962,29 +962,31 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
                 print("Ошибка: объект не содержит вершин")
                 return None
 
+            # Получаем нормаль полигона в мировых координатах
+            # По стандарту Blender нормаль направлена "наружу" от поверхности
             face_normal_world = (world_matrix.to_3x3() @ face.normal).normalized()
             face_center = world_matrix @ face.calc_center_median()
 
-            # Дополнительная проверка перед делением
-            if len(all_verts) == 0:
-                return None
+            print(f"[CAMERA DEBUG] Полигон {face.index}: исходная нормаль = ({face_normal_world.x:.3f}, {face_normal_world.y:.3f}, {face_normal_world.z:.3f})")
 
-            centroid = sum([world_matrix @ v.co for v in all_verts], Vector()) / len(all_verts)
-            centroid_proj = (centroid - face_center).dot(face_normal_world)
+            # Проверяем ориентацию нормали относительно вертикали
+            # Для крыш и полов может потребоваться специальная обработка
+            z_component = face_normal_world.z
 
+            # Если это пол (нормаль смотрит вниз), инвертируем ее
+            # чтобы камера располагалась сверху и смотрела вниз
+            if abs(z_component) > ANGLE_45_DEGREES and z_component < 0:
+                face_normal_world = -face_normal_world
+                print(f"[CAMERA DEBUG] Пол обнаружен, нормаль инвертирована для правильного размещения камеры")
+
+            # Вычисляем проекции всех вершин на нормаль для расчета расстояния
             projs = [(world_matrix @ v.co - face_center).dot(face_normal_world) for v in all_verts]
 
-            if centroid_proj > 0:
-                face_normal_world = -face_normal_world
-                projs = [-p for p in projs]
-                centroid_proj = (centroid - face_center).dot(face_normal_world)
-
-            z_dot = face_normal_world.dot(Vector((0, 0, 1)))
-            if abs(z_dot) > ANGLE_45_DEGREES and z_dot < 0:
-                face_normal_world = -face_normal_world
-                projs = [-p for p in projs]
-
-            rotation = (-face_normal_world).to_track_quat('-Z', 'Y')
+            # Создаем поворот камеры:
+            # - Нормаль (face_normal_world) указывает ОТ поверхности наружу
+            # - Камера должна смотреть НА поверхность (против нормали)
+            # - Ось +Z камеры выравниваем вдоль нормали, тогда -Z (направление взгляда) смотрит против нормали
+            rotation = face_normal_world.to_track_quat('Z', 'Y')
 
             if self.auto_distance:
                 min_proj = min(projs)
@@ -1035,7 +1037,8 @@ class SDE_OT_create_cameras_from_faces(bpy.types.Operator):
 
             # Рассчитываем clipping planes
             if self.auto_clipping:
-                camera_direction = -face_normal_world  # Направление взгляда камеры
+                # Направление взгляда камеры - против нормали (камера смотрит на поверхность)
+                camera_direction = -face_normal_world
                 clip_start, clip_end = calculate_clipping_planes(obj, final_location, camera_direction)
             else:
                 # Значения по умолчанию
